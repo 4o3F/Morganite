@@ -1,7 +1,7 @@
 use kokoro_tts::Voice;
 
 pub fn parse_voice(s: &str) -> Result<Voice, String> {
-    let speed = 0;
+    let speed = 0.;
 
     match s {
         "zm_029" => Ok(Voice::Zm029(speed)),
@@ -111,7 +111,7 @@ pub fn parse_voice(s: &str) -> Result<Voice, String> {
     }
 }
 
-pub fn change_voice_speed(voice: Voice, speed: i32) -> Voice {
+pub fn change_voice_speed(voice: Voice, speed: f32) -> Voice {
     match voice {
         Voice::Zm029(_) => Voice::Zm029(speed),
         Voice::Zf048(_) => Voice::Zf048(speed),

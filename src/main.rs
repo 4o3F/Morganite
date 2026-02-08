@@ -43,8 +43,8 @@ struct Cli {
     voice: Voice,
 
     /// Speech speed
-    #[arg(long, default_value_t = 1)]
-    speed: i32,
+    #[arg(long, default_value_t = 1.0)]
+    speed: f32,
 
     /// Concurrency
     #[arg(long, default_value_t = 4)]
@@ -163,18 +163,16 @@ async fn main() {
 
             set.spawn(async move {
                 let _permit = permit;
+                tracing::info!("Audio idx {} started", current_audio_idx);
 
                 let res = tts_engine
                     .synth::<String>(line, voice)
                     .await
                     .map_err(|e| anyhow::anyhow!("{}", e));
 
+                tracing::info!("Audio idx {} finished", current_audio_idx);
                 let _ = tx2.send((current_audio_idx, res)).await;
-                tracing::info!(
-                    "Audio idx {} line idx {} finished",
-                    current_audio_idx,
-                    line_index
-                );
+                tracing::info!("Audio idx {} sent to channel", current_audio_idx);
 
                 header_span.pb_inc(1);
                 Ok(())
