@@ -7,9 +7,9 @@ use std::{
     time::Duration,
 };
 
+use anyhow::Context;
 use chrono::Local;
 use clap::Parser;
-use hound::{SampleFormat, WavSpec};
 use kokoro_tts::Voice;
 use tokio::{
     sync::{Semaphore, mpsc},
@@ -106,14 +106,17 @@ async fn main() {
 
     tracing::info!("Initialized KokoroTTS engine");
 
-    let spec = WavSpec {
-        channels: writer::CHANNELS,
-        sample_rate: writer::SAMPLE_RATE,
-        bits_per_sample: 16,
-        sample_format: SampleFormat::Int,
-    };
-    let mut wav = writer::WavSplitter::new(format!("{}/audio", timestamp), spec)
-        .expect_or_log("Failed to create WAV split writer");
+    let spec = writer::default_mono_24k_config(64);
+    // let mut wav = writer::WavSplitter::new(format!("{}/audio", timestamp), spec)
+    //     .expect_or_log("Failed to create WAV split writer");
+
+    let mut mp3 = writer::Mp3Splitter::new(
+        format!("{}/audio", timestamp),
+        spec,
+        Duration::from_mins(30),
+    )
+    .context("init mp3 writer")
+    .unwrap_or_log();
 
     // let text_file = PathBuf::from(cli.text_file);
     let text_file = File::open(&cli.text_file).expect_or_log("Failed to open text file");
@@ -194,7 +197,7 @@ async fn main() {
         buffer.insert(idx, (audio, took));
 
         while let Some((audio, took)) = buffer.remove(&next_expected) {
-            wav.write_f32_mono(&audio)
+            mp3.write_f32_mono(&audio)
                 .expect_or_log("Failed to write to wav");
             tracing::info!("Audio idx {next_expected} took {:?}", took);
             next_expected += 1;
@@ -206,5 +209,5 @@ async fn main() {
         .unwrap()
         .expect_or_log("Failed to finish synth task");
 
-    wav.finalize().expect_or_log("Failed to finalize wav write");
+    mp3.finalize().expect_or_log("Failed to finalize wav write");
 }
