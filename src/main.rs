@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     fs::File,
     io::{BufRead, BufReader},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -27,7 +27,7 @@ mod writer;
 
 #[derive(clap::Parser)]
 struct Cli {
-    /// Path for the file to be converted
+    /// Path to a single .txt file OR a folder containing multiple .txt files
     text_file: String,
 
     /// Path for onnx tts model
@@ -53,15 +53,46 @@ struct Cli {
 
 type Msg = (usize, anyhow::Result<(Vec<f32>, Duration)>);
 
+fn is_txt(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("txt"))
+        .unwrap_or(false)
+}
+
+fn file_stem_string(p: &Path) -> String {
+    p.file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn read_non_empty_lines(path: &Path) -> anyhow::Result<Vec<String>> {
+    let f =
+        File::open(path).with_context(|| format!("Failed to open text file {}", path.display()))?;
+    let reader = BufReader::new(f);
+    Ok(reader
+        .lines()
+        .map(|l| {
+            l.expect_or_log("Failed to get line of text file")
+                .trim()
+                .to_string()
+        })
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>())
+}
+
 #[tokio::main]
 async fn main() {
     let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
+
+    // Keep a top-level timestamp folder for logs (and for single-file output, like before)
     let target_dir = PathBuf::from(&timestamp);
     if !target_dir.exists() {
         std::fs::create_dir(&target_dir).expect("Failed to create target dir");
     }
-    let file_path = format!("{}/app.log", timestamp);
 
+    let file_path = format!("{}/app.log", timestamp);
     let file_appender = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -97,117 +128,167 @@ async fn main() {
     tracing::info!("Using ONNX TTS model {}", cli.tts_model);
     tracing::info!("Using voice model {}", cli.voice_model);
 
-    if !PathBuf::from(&cli.text_file).exists() {
-        tracing::error!("Unable to find text file {}", cli.text_file);
+    let input_path = PathBuf::from(&cli.text_file);
+    if !input_path.exists() {
+        tracing::error!("Unable to find input path {}", cli.text_file);
         return;
     }
 
-    let tts_engine = tts::init_tts(cli.tts_model, cli.voice_model, cli.concurrency).await;
-
-    tracing::info!("Initialized KokoroTTS engine");
-
-    let spec = writer::default_mono_24k_config(64);
-    // let mut wav = writer::WavSplitter::new(format!("{}/audio", timestamp), spec)
-    //     .expect_or_log("Failed to create WAV split writer");
-
-    let mut mp3 = writer::Mp3Splitter::new(
-        format!("{}/audio", timestamp),
-        spec,
-        Duration::from_mins(30),
-    )
-    .context("init mp3 writer")
-    .unwrap_or_log();
-
-    // let text_file = PathBuf::from(cli.text_file);
-    let text_file = File::open(&cli.text_file).expect_or_log("Failed to open text file");
-    let total_lines = {
-        let text_reader = BufReader::new(&text_file);
-        text_reader
-            .lines()
-            .map(|l| {
-                l.expect_or_log("Failed to get line of text file")
-                    .trim()
-                    .to_string()
-            })
-            .filter(|l| !l.is_empty())
-            .collect::<Vec<_>>()
+    // Build the list of txt files to process
+    let (txt_files, folder_mode): (Vec<PathBuf>, bool) = if input_path.is_file() {
+        if !is_txt(&input_path) {
+            tracing::error!("Input file is not a .txt: {}", input_path.display());
+            return;
+        }
+        (vec![input_path.clone()], false)
+    } else if input_path.is_dir() {
+        let mut files = std::fs::read_dir(&input_path)
+            .expect_or_log("Failed to read input directory")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_file() && is_txt(p))
+            .collect::<Vec<_>>();
+        files.sort();
+        if files.is_empty() {
+            tracing::error!("No .txt files found in folder {}", input_path.display());
+            return;
+        }
+        (files, true)
+    } else {
+        tracing::error!(
+            "Input path is neither a file nor a directory: {}",
+            input_path.display()
+        );
+        return;
     };
-    tracing::info!("Target file total {} line", total_lines.len());
+
+    // Init TTS once; share via Arc so tasks can clone handles safely.
+    let tts_engine = Arc::new(tts::init_tts(cli.tts_model, cli.voice_model, cli.concurrency).await);
+    tracing::info!("Initialized KokoroTTS engine");
 
     let voice = utils::change_voice_speed(cli.voice, cli.speed);
 
-    let sem = Arc::new(Semaphore::new(cli.concurrency * 2));
-    let (tx, mut rx) = mpsc::channel::<Msg>(cli.concurrency * 2);
+    // Process each txt file (single file => one iteration)
+    for txt_path in txt_files {
+        let file_label = txt_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown.txt")
+            .to_string();
 
-    let producer: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-        let mut set = JoinSet::<anyhow::Result<()>>::new();
+        tracing::info!("Processing {}", txt_path.display());
 
-        let header_span = tracing::info_span!("task");
-        header_span.pb_set_style(
-            &ProgressStyle::with_template("{spinner} {msg}\n{wide_bar} {pos}/{len}").unwrap(),
+        // Decide mp3 output prefix and ensure output folder exists
+        let mp3_prefix = if folder_mode {
+            let file_name = file_stem_string(&txt_path);
+            let out_dir = PathBuf::from(&timestamp).join(&file_name);
+            std::fs::create_dir_all(&out_dir)
+                .with_context(|| format!("Failed to create output folder {}", out_dir.display()))
+                .unwrap_or_log();
+            format!("{}/{}/audio", timestamp, file_name)
+        } else {
+            // Original behavior: put audio_000.mp3... under the timestamp folder
+            format!("{}/audio", timestamp)
+        };
+
+        // Fresh config per file (cheap)
+        let spec = writer::default_mono_24k_config(64);
+
+        let mut mp3 = writer::Mp3Splitter::new(mp3_prefix, spec, Duration::from_hours(2))
+            .context("init mp3 writer")
+            .unwrap_or_log();
+
+        let total_lines = read_non_empty_lines(&txt_path)
+            .with_context(|| format!("Failed reading lines for {}", txt_path.display()))
+            .unwrap_or_log();
+
+        tracing::info!(
+            "Target file {} total {} line",
+            file_label,
+            total_lines.len()
         );
-        header_span.pb_set_length(total_lines.len() as u64);
-        header_span.pb_set_message("Processing items");
-        header_span.pb_set_finish_message("All items processed");
 
-        let header_span_enter = header_span.enter();
+        let sem = Arc::new(Semaphore::new(cli.concurrency * 2));
+        let (tx, mut rx) = mpsc::channel::<Msg>(cli.concurrency * 2);
 
-        for (line_index, line) in total_lines.iter().enumerate() {
-            let line = line.clone();
-            if line.is_empty() {
-                unreachable!()
+        let tts_engine2 = tts_engine.clone();
+        let voice2 = voice;
+
+        let producer: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+            let mut set = JoinSet::<anyhow::Result<()>>::new();
+
+            let header_span = tracing::info_span!("task");
+            header_span.pb_set_style(
+                &ProgressStyle::with_template("{spinner} {msg}\n{wide_bar} {pos}/{len}").unwrap(),
+            );
+            header_span.pb_set_length(total_lines.len() as u64);
+            header_span.pb_set_message(format!("Processing {}", file_label).as_str());
+            header_span
+                .pb_set_finish_message(format!("All items processed ({})", file_label).as_str());
+
+            let header_span_enter = header_span.enter();
+
+            for (line_index, line) in total_lines.iter().enumerate() {
+                let line = line.clone();
+                if line.is_empty() {
+                    unreachable!()
+                }
+
+                let permit = sem.clone().acquire_owned().await?;
+                let tx2 = tx.clone();
+                let header_span = header_span.clone();
+                let current_audio_idx = line_index;
+
+                let engine = tts_engine2.clone();
+                let voice = voice2;
+
+                set.spawn(async move {
+                    let _permit = permit;
+                    tracing::info!("Audio idx {} started", current_audio_idx);
+
+                    let res = engine
+                        .synth::<String>(line, voice)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{}", e));
+
+                    tracing::info!("Audio idx {} finished", current_audio_idx);
+                    let _ = tx2.send((current_audio_idx, res)).await;
+                    tracing::info!("Audio idx {} sent to channel", current_audio_idx);
+
+                    header_span.pb_inc(1);
+                    Ok(())
+                });
             }
 
-            let permit = sem.clone().acquire_owned().await?;
+            drop(tx);
+            while let Some(r) = set.join_next().await {
+                r??;
+            }
+            drop(header_span_enter);
+            Ok(())
+        });
 
-            let tx2 = tx.clone();
-            let header_span = header_span.clone();
-            let current_audio_idx = line_index;
+        let mut next_expected: usize = 0;
+        let mut buffer: BTreeMap<usize, (Vec<f32>, Duration)> = BTreeMap::new();
 
-            set.spawn(async move {
-                let _permit = permit;
-                tracing::info!("Audio idx {} started", current_audio_idx);
+        while let Some((idx, res)) = rx.recv().await {
+            let (audio, took) = res.expect_or_log("Failed to get synth result");
+            buffer.insert(idx, (audio, took));
 
-                let res = tts_engine
-                    .synth::<String>(line, voice)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{}", e));
-
-                tracing::info!("Audio idx {} finished", current_audio_idx);
-                let _ = tx2.send((current_audio_idx, res)).await;
-                tracing::info!("Audio idx {} sent to channel", current_audio_idx);
-
-                header_span.pb_inc(1);
-                Ok(())
-            });
+            while let Some((audio, took)) = buffer.remove(&next_expected) {
+                mp3.write_f32_mono(&audio)
+                    .expect_or_log("Failed to write to mp3");
+                tracing::info!("Audio idx {next_expected} took {:?}", took);
+                next_expected += 1;
+            }
         }
-        drop(tx);
-        while let Some(r) = set.join_next().await {
-            r??;
-        }
-        drop(header_span_enter);
-        Ok(())
-    });
 
-    let mut next_expected: usize = 0;
-    let mut buffer: BTreeMap<usize, (Vec<f32>, Duration)> = BTreeMap::new();
+        producer
+            .await
+            .unwrap()
+            .expect_or_log("Failed to finish synth task");
 
-    while let Some((idx, res)) = rx.recv().await {
-        let (audio, took) = res.expect_or_log("Failed to get synth result");
-        buffer.insert(idx, (audio, took));
+        mp3.finalize().expect_or_log("Failed to finalize mp3 write");
 
-        while let Some((audio, took)) = buffer.remove(&next_expected) {
-            mp3.write_f32_mono(&audio)
-                .expect_or_log("Failed to write to wav");
-            tracing::info!("Audio idx {next_expected} took {:?}", took);
-            next_expected += 1;
-        }
+        tracing::info!("Finished {}", txt_path.display());
     }
-
-    producer
-        .await
-        .unwrap()
-        .expect_or_log("Failed to finish synth task");
-
-    mp3.finalize().expect_or_log("Failed to finalize wav write");
 }

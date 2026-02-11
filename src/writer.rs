@@ -124,7 +124,7 @@ impl Mp3Splitter {
         let ch = self.config.channels as usize;
         anyhow::ensure!(ch == 1 || ch == 2, "only 1 or 2 channels supported");
         anyhow::ensure!(
-            samples.len() % ch == 0,
+            samples.len().is_multiple_of(ch),
             "interleaved buffer length must be a multiple of channels"
         );
 
